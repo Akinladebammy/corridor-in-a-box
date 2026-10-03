@@ -51,6 +51,17 @@ Schema only; the engine does not act on it yet. Manifests that omit `protocol`
 parse as `prefunded`, so existing corridors are unchanged. `corridor plan` now
 prints the source protocol.
 
+### Docs — `web/README.md` matches the app again: three liveness states, six docs pages, own workspace root (#126) (2026-09-29)
+
+`web/README.md` described the app it documents in three stale ways: it called the
+dashboard's build-time liveness "runnable / not runnable" when the dashboard has
+three states — `verified` / `unverified` / `not runnable`, and only `verified`
+counts as runnable — it listed five of the six shipped docs pages (omitting "Why
+not Anchor Platform?"), and it called the app "not part of the pnpm workspace"
+although `web/` has been its own pnpm workspace root since #80
+(`web/pnpm-workspace.yaml`, with its own lockfile and its own CI job).
+Documentation only — no code, no behaviour change.
+
 ### Maintenance — ESLint 10 landed
 
 - `eslint` 10 landed in [#37](https://github.com/ezedike-evan/corridor-in-a-box/pull/37).
