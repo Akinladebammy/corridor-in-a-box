@@ -537,10 +537,6 @@ export interface HorizonPaymentRecordLike {
 export type AccountInspectorServerLike = Pick<Horizon.Server, "loadAccount"> &
   Partial<Pick<Horizon.Server, "payments" | "transactions">>;
 
-export interface AccountInspectorOptions {
-  readonly horizonUrl?: string;
-  readonly horizonServer?: AccountInspectorServerLike;
-
 export interface HorizonPaymentOperationLike {
   readonly type?: string;
   readonly to?: string;
@@ -580,6 +576,10 @@ export interface PaymentExpectation {
   readonly assetCode?: string;
   readonly assetIssuer?: string;
 }
+
+export interface AccountInspectorOptions {
+  readonly horizonUrl?: string;
+  readonly horizonServer?: AccountInspectorServerLike;
   readonly baseReserve?: string;
   readonly baseFee?: string;
 }
@@ -726,7 +726,6 @@ export class AccountInspector {
     }
   }
 
-
   async transaction(hash: string): Promise<Outcome<TransactionFacts | undefined>> {
     if (!this.server.transactions) {
       return fail(
@@ -768,7 +767,6 @@ export class AccountInspector {
       );
     }
   }
-
 
   /**
    * Chain-verify the settlement leg before a canary proof is written. The
