@@ -35,6 +35,7 @@ describe("manifest", () => {
       expect(r.value.fx.quote_ttl_seconds).toBe(60); // default applied
       expect(r.value.settlement.bridge_asset).toBe("USDC"); // default applied
       expect(r.value.recovery.rollback).toBe("refund_sender"); // default applied
+      expect(r.value.recovery.reconcile.external_stall_seconds).toBe(21_600);
     }
   });
 
@@ -303,7 +304,10 @@ describe("recovery.reconcile", () => {
   it("is optional and leaves the fields unset by default", () => {
     const r = parseCorridor(valid);
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.value.recovery.reconcile).toBeUndefined();
+    if (r.ok) {
+      expect(r.value.recovery.reconcile.poll_seconds).toBeUndefined();
+      expect(r.value.recovery.reconcile.stall_polls).toBeUndefined();
+    }
   });
 
   it("parses poll_seconds and stall_polls (0 allowed to disable)", () => {
@@ -312,9 +316,10 @@ describe("recovery.reconcile", () => {
       recovery: { reconcile: { poll_seconds: 5, stall_polls: 0 } },
     });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.value.recovery.reconcile).toEqual({ poll_seconds: 5, stall_polls: 0 });
+    if (r.ok)
+      expect(r.value.recovery.reconcile).toMatchObject({ poll_seconds: 5, stall_polls: 0 });
     const partial = parseCorridor({ ...valid, recovery: { reconcile: { stall_polls: 4 } } });
-    expect(partial.ok && partial.value.recovery.reconcile?.poll_seconds).toBeUndefined();
+    expect(partial.ok && partial.value.recovery.reconcile.poll_seconds).toBeUndefined();
   });
 
   it("rejects non-positive poll_seconds and negative stall_polls", () => {
