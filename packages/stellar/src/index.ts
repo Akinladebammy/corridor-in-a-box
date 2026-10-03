@@ -1138,3 +1138,5 @@ export function destinationCheck(
     },
   };
 }
+
+export { tomlHashCheck, type TomlHashCheckOptions } from "./toml-hash-check";
