@@ -68,3 +68,4 @@ export {
   type GateContext,
   type PreSettleGate,
 } from "./gate";
+export { quoteWindowCheck } from "./quoteWindow";
