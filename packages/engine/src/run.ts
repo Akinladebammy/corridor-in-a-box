@@ -17,7 +17,6 @@ import {
   type PaymentIntent,
 } from "@corridor/types";
 import type { RouteResolver } from "@corridor/router";
-import type { GateContext, PreSettleGate } from "./gate";
 import { canTransition, isTerminal, type CorridorState } from "./state";
 import {
   InMemoryIdempotencyStore,
@@ -56,6 +55,7 @@ import {
   type Logger,
   type Metrics,
 } from "./observability";
+import type { CheckResult, GateContext, PreSettleGate } from "./gate";
 
 export interface EngineDeps {
   resolver: RouteResolver;
@@ -105,6 +105,11 @@ export interface EngineDeps {
    * on-chain attestation.
    */
   trustManifestWithoutAttestation?: boolean;
+  /**
+   * Explicit escape hatch skipping pre-settle verification. When true, execute() bypasses gate
+   * evaluation while recording `gate.skipped` in the audit log and emitting a warning.
+   */
+  unsafeSkipPreSettleGate?: boolean;
 }
 
 export interface RunResult {
@@ -156,6 +161,16 @@ export async function execute(
     metrics.timing(`corridor.verb.${name}`, now() - begin, { corridor: corridor.id });
     return r;
   };
+
+  // --- configuration guard: pre-settle gate is mandatory by default.
+  // Fail closed before claiming idempotency key (no run row persisted) unless
+  // an explicit opt-out is provided.
+  if (!deps.gate && deps.unsafeSkipPreSettleGate !== true) {
+    return fail(
+      "ENGINE_MISCONFIGURED",
+      "pre-settle gate is required; supply deps.gate or explicitly opt out with deps.unsafeSkipPreSettleGate = true",
+    );
+  }
 
   // --- input guard: never let a malformed or non-positive amount reach the
   // chain. `isSettleableAmount` and not `isValidAmount`: the latter is a syntax
@@ -360,13 +375,9 @@ export async function execute(
       return die({ code: "AMOUNT_INVALID", message: settleProblem, retryable: false });
     }
 
-    {
-      const t = await advance("verifying");
-      if (!t.ok) return die(t.error);
-    }
-
+    let gateChecks: CheckResult[];
     if (deps.gate) {
-      const gateContext: GateContext = {
+      const gateCtx: GateContext = {
         intent,
         corridor,
         quote: q.value,
@@ -374,32 +385,64 @@ export async function execute(
         now: now(),
         attempt,
       };
-
       let gateResult;
       try {
-        gateResult = await timed("verify", () => deps.gate!.evaluate(gateContext));
+        gateResult = await timed("verify", () => deps.gate!.evaluate(gateCtx));
       } catch (e) {
+        // Record the attempt at the gate so the audit trail shows where it died.
+        await advance("verifying");
         return die({
           code: "SETTLEMENT_FAILED",
           message: e instanceof Error ? e.message : String(e),
           retryable: false,
         });
       }
-
-      for (const check of gateResult.results) {
+      gateChecks = gateResult.results;
+      for (const check of gateChecks) {
         metrics.increment("corridor.gate.check", {
           name: check.name,
           passed: String(check.passed),
         });
       }
-
+      {
+        const t = await advance("verifying", { checks: gateChecks });
+        if (!t.ok) return die(t.error);
+      }
       if (!gateResult.passed) {
-        const firstFailure = gateResult.results.find((r) => !r.passed);
-        return die({
-          code: firstFailure?.code ?? "SETTLEMENT_FAILED",
-          message: firstFailure?.detail ?? "pre-settle gate failed",
-          retryable: false,
-        });
+        const failure = gateChecks.find((r) => !r.passed)!;
+        return die(
+          {
+            code: failure.code ?? "SETTLEMENT_FAILED",
+            message: failure.detail,
+            retryable: false,
+          },
+          gateChecks,
+        );
+      }
+    } else {
+      const skippedCheck: CheckResult = {
+        name: "gate.skipped",
+        passed: true,
+        detail: "unsafeSkipPreSettleGate",
+        durationMs: 0,
+      };
+      gateChecks = [skippedCheck];
+      (deps.logger ?? silentLogger).log(
+        "warn",
+        "pre-settle gate skipped via unsafeSkipPreSettleGate",
+        {
+          idempotencyKey: run.idempotencyKey,
+          corridor: corridor.id,
+          attempt,
+        },
+      );
+      metrics.increment("corridor.gate.check", {
+        name: skippedCheck.name,
+        passed: "true",
+      });
+      {
+        const t = await advance("verifying", { checks: gateChecks });
+        if (!t.ok) return die(t.error);
       }
     }
 
@@ -544,11 +587,12 @@ interface AdvanceMeta {
   networkFee?: string;
   amountRefunded?: string;
   amountFee?: string;
+  checks?: readonly CheckResult[];
 }
 
 interface RunContext {
   advance(to: CorridorState, meta?: AdvanceMeta): Promise<Outcome<void>>;
-  die(error: CorridorError): Promise<Err>;
+  die(error: CorridorError, checks?: readonly CheckResult[]): Promise<Err>;
   finishFailure(error: CorridorError): Promise<Err>;
   holdAndStop(error: CorridorError, status?: TransactionStatus): Promise<Err>;
 }
@@ -587,7 +631,7 @@ function createRunContext(init: RunContextInit): RunContext {
     return ok(undefined);
   };
 
-  const die: RunContext["die"] = async (error) => {
+  const die: RunContext["die"] = async (error, checks) => {
     if (!canTransition(run.state, "failed")) return { ok: false, error };
     const from = run.state;
     run.lastError = `${error.code}: ${error.message}`;
@@ -595,7 +639,15 @@ function createRunContext(init: RunContextInit): RunContext {
     run.version += 1;
     trail.push("failed");
     await store.put(run);
-    await emitTransition(deps, run, from, now(), run.lastError, routeTrust);
+    await emitTransition(
+      deps,
+      run,
+      from,
+      now(),
+      run.lastError,
+      routeTrust,
+      checks ? { checks } : undefined,
+    );
     return { ok: false, error };
   };
 
@@ -743,6 +795,7 @@ async function emitTransition(
     networkFee?: string;
     amountRefunded?: string;
     amountFee?: string;
+    checks?: readonly CheckResult[];
   },
 ): Promise<void> {
   const entry: AuditEntry = {
@@ -758,6 +811,7 @@ async function emitTransition(
     ...(meta?.networkFee && { networkFee: meta.networkFee }),
     ...(meta?.amountRefunded !== undefined && { amountRefunded: meta.amountRefunded }),
     ...(meta?.amountFee !== undefined && { amountFee: meta.amountFee }),
+    ...(meta?.checks && meta.checks.length > 0 && { checks: meta.checks }),
   };
   (deps.logger ?? silentLogger).log(error ? "error" : "info", "corridor.transition", entry);
   const metrics = deps.metrics ?? noopMetrics;

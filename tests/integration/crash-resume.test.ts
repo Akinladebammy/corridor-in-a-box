@@ -147,7 +147,12 @@ describe.skipIf(!hasAnchor)("crash-resume (live anchor, in-memory store)", () =>
     };
 
     // First run: complete normally
-    const firstRun = await execute(intent, c, { resolver, submitter, idempotency: store });
+    const firstRun = await execute(intent, c, {
+      resolver,
+      submitter,
+      idempotency: store,
+      unsafeSkipPreSettleGate: true,
+    });
 
     if (!firstRun.ok) {
       console.warn(
@@ -173,10 +178,17 @@ describe.skipIf(!hasAnchor)("crash-resume (live anchor, in-memory store)", () =>
         version: existing!.version - 1,
       });
 
-      const resumed = await execute(intent, c, { resolver, submitter, idempotency: store });
+      // Second execute() with same key: must resume, never re-settle
+      const resumed = await execute(intent, c, {
+        resolver,
+        submitter,
+        idempotency: store,
+        unsafeSkipPreSettleGate: true,
+      });
       expect(resumed.ok).toBe(true);
       if (resumed.ok) {
         expect(resumed.value.state).toBe("completed");
+        // THE critical assertion
         expect(hashes).toHaveLength(1);
         expect(resumed.value.stellarTxHash).toBe(txHash);
       }
@@ -224,7 +236,12 @@ describe.skipIf(!hasAnchor || !hasDb)("crash-resume (live anchor + Postgres)", (
     };
 
     // First execute: run through to completion
-    const firstRun = await execute(intent, c, { resolver, submitter, idempotency: store });
+    const firstRun = await execute(intent, c, {
+      resolver,
+      submitter,
+      idempotency: store,
+      unsafeSkipPreSettleGate: true,
+    });
 
     if (!firstRun.ok) {
       console.warn(
@@ -253,7 +270,12 @@ describe.skipIf(!hasAnchor || !hasDb)("crash-resume (live anchor + Postgres)", (
     expect(rowAfterRollback?.transactionId).toBe(txId);
 
     // Second execute() with same key: must resume from settled, not re-settle
-    const secondRun = await execute(intent, c, { resolver, submitter, idempotency: store });
+    const secondRun = await execute(intent, c, {
+      resolver,
+      submitter,
+      idempotency: store,
+      unsafeSkipPreSettleGate: true,
+    });
 
     expect(secondRun.ok).toBe(true);
     if (secondRun.ok) {
