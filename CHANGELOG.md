@@ -99,6 +99,19 @@ Schema only; the engine does not act on it yet. Manifests that omit `protocol`
 parse as `prefunded`, so existing corridors are unchanged. `corridor plan` now
 prints the source protocol.
 
+### Added — corridor canary CLI command (#161) (2026-09-30)
+
+Added `corridor canary <file.corridor.yaml> --amount <amount> [--network public]` CLI subcommand
+and shared wiring module (`@corridor/cli/wire`):
+
+- Drives one full, gated payment through the real stack (`Sep31Adapter`, `StellarSettlementSubmitter`, pre-settle gate, `RegistryRouteResolver`).
+- Refuses unless amount ≤ `proof.canary_max_amount` (defaults to `10.00`) and corridor liveness is at least `verified`.
+- Requires `--network public` to run on mainnet; default refuses mainnet manifests.
+- Pre-settle gate (`balanceCheck`) verifies sender balances and reserve before on-chain settlement.
+- Engine: added optional `gate` to `EngineDeps` and evaluate before advancing to `settling`.
+- Manifest: added optional `proof.canary_max_amount` to `CorridorSchema`.
+- Reused wiring in both CLI canary subcommand and `examples/verify-corridor.ts`.
+
 ### Docs — `web/README.md` matches the app again: three liveness states, six docs pages, own workspace root (#126) (2026-09-29)
 
 `web/README.md` described the app it documents in three stale ways: it called the
