@@ -30,6 +30,8 @@ export {
   type SettlementRef,
   type SettlementRequest,
   type RefundRequest,
+  type ReconcileWaker,
+  InMemoryWaker,
   type SettlementStrategy,
   type SettlementStrategyContext,
   type DepositInstructionsKind,
