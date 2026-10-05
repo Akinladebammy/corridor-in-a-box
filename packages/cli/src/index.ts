@@ -1,65 +1,108 @@
 #!/usr/bin/env node
-// corridor — manifest validation, offline planning, and a real canary run.
+// corridor — a tiny CLI to validate manifests, dry-run the plan offline,
+// and drive live gated canary payments through the real stack.
 //
 //   corridor validate <file.corridor.yaml>
 //   corridor plan     <file.corridor.yaml>
-//   corridor canary   <file.corridor.yaml> --amount <decimal> [--write]
+//   corridor canary   <file.corridor.yaml> --amount <amount> [--network <public|testnet>]
 //
 // `plan` is the cheap pre-flight: it tells you whether a corridor is actually
 // runnable (does the dest anchor expose SEP-31? a SEP-38 quote server?) before
-// you ever touch the network. `canary` is the opt-in real payment: it only
-// records a proof after the completed settlement has been read back from
-// Horizon.
+// you ever touch the network.
+//
+// `canary` drives one tiny real payment through the full, gated stack:
+// Sep31Adapter + StellarSettlementSubmitter + the default gate + RegistryRouteResolver.
 
 import { liveness, loadCorridor, type Corridor } from "@corridor/manifest";
-import { canaryUsage, runCanary } from "./canary";
-
-const USAGE = "usage: corridor <validate|plan|canary> <file.corridor.yaml>";
+import { isSettleableAmount } from "@corridor/types";
+import { PostgresIdempotencyStore, migrate } from "@corridor/engine";
+import {
+  RESOLVE_USAGE,
+  listHeldRuns,
+  parseListArgs,
+  parseResolveArgs,
+  resolveHeldRun,
+} from "./runs.js";
+import { AccountInspector } from "@corridor/stellar";
+import { finalizeCanary } from "./proof.js";
+import { EXIT_NOT_COMPLETED, executeCanary } from "./wire.js";
 
 async function main(argv: string[]): Promise<number> {
-  const [cmd, file, ...rest] = argv;
-  if (!cmd || (cmd !== "validate" && cmd !== "plan" && cmd !== "canary")) {
-    console.error(USAGE);
-    return 2;
+  const [cmd] = argv;
+  if (cmd === "runs") {
+    const parsed = parseListArgs(argv.slice(1));
+    return parsed ? withStore((store) => listHeldRuns(store, parsed)) : 2;
   }
-  if (!file) {
-    console.error(`usage: corridor ${cmd} <file.corridor.yaml>`);
+  if (cmd === "resolve") return resolveCommand(argv.slice(1));
+  if (!cmd || (cmd !== "validate" && cmd !== "plan" && cmd !== "canary")) {
+    console.error(
+      "usage: corridor <validate|plan|canary> <file.corridor.yaml> [options] | runs list --state held | resolve <key> --outcome <outcome> --note <text>",
+    );
     return 2;
   }
 
   if (cmd === "canary") {
+    let file: string | undefined;
     let amount: string | undefined;
+    let network: string | undefined;
+    let skipDoctor = false;
     let write = false;
-    let network: "public" | "testnet" | undefined;
+
+    const rest = argv.slice(1);
     for (let i = 0; i < rest.length; i++) {
       const arg = rest[i];
-      if (arg === "--write") {
-        if (write) {
-          console.error("✗ --write may only be supplied once");
+      if (arg === "--amount") {
+        if (i + 1 >= rest.length || rest[i + 1].startsWith("--")) {
+          console.error("error: --amount requires a value");
           return 2;
         }
+        amount = rest[++i];
+      } else if (arg.startsWith("--amount=")) {
+        amount = arg.slice("--amount=".length);
+      } else if (arg === "--network") {
+        if (i + 1 >= rest.length || rest[i + 1].startsWith("--")) {
+          console.error("error: --network requires a value");
+          return 2;
+        }
+        network = rest[++i];
+      } else if (arg.startsWith("--network=")) {
+        network = arg.slice("--network=".length);
+      } else if (arg === "--skip-doctor") {
+        skipDoctor = true;
+      } else if (arg === "--write") {
         write = true;
-        continue;
-      }
-      if (arg === "--amount" || arg === "--network") {
-        const value = rest[++i];
-        if (!value || value.startsWith("--")) {
-          console.error(`✗ ${arg} requires a value`);
+      } else if (arg.startsWith("--")) {
+        console.error(`error: unknown option "${arg}"`);
+        return 2;
+      } else {
+        if (!file) {
+          file = arg;
+        } else {
+          console.error(`error: unexpected argument "${arg}"`);
           return 2;
         }
-        if (arg === "--amount") amount = value;
-        else if (value === "public" || value === "testnet") network = value;
-        else {
-          console.error("✗ --network must be public or testnet");
-          return 2;
-        }
-        continue;
       }
-      console.error(`✗ unknown canary option: ${arg}`);
+    }
+
+    if (!file) {
+      console.error(
+        "usage: corridor canary <file.corridor.yaml> --amount <amount> [--network <public|testnet>] [--write]",
+      );
       return 2;
     }
-    if (!amount) {
-      console.error(canaryUsage());
+
+    if (amount === undefined || amount === "") {
+      console.error("error: --amount <amount> is required for canary");
+      return 2;
+    }
+
+    if (!isSettleableAmount(amount)) {
+      console.error(`error: --amount must be a positive decimal amount (got "${amount}")`);
+      return 2;
+    }
+
+    if (network !== undefined && network !== "public" && network !== "testnet") {
+      console.error(`error: --network must be "public" or "testnet" (got "${network}")`);
       return 2;
     }
 
@@ -68,7 +111,42 @@ async function main(argv: string[]): Promise<number> {
       console.error(`✗ ${loaded.error.code}: ${loaded.error.message}`);
       return 1;
     }
-    return runCanary(loaded.value, { manifestPath: file, amount, write, network });
+
+    const runResult = await executeCanary(loaded.value, {
+      amount,
+      network,
+      skipDoctor,
+    });
+    if (runResult.exitCode !== 0 || !runResult.run || !runResult.settlement) {
+      return runResult.exitCode;
+    }
+
+    // Re-read the settlement from Horizon and print the proof block it earned;
+    // with --write also record it in the manifest (comments preserved). A run
+    // that did not complete returned above, so the file stays byte-identical.
+    const finalized = await finalizeCanary({
+      result: runResult.run,
+      settlement: runResult.settlement,
+      corridor: loaded.value,
+      verifier: new AccountInspector({ horizonUrl: runResult.horizonUrl }),
+      manifestPath: file,
+      write,
+    });
+    if (!finalized.ok) {
+      console.error(
+        `✗ canary proof rejected: ${finalized.error.code} — ${finalized.error.message}`,
+      );
+      return EXIT_NOT_COMPLETED;
+    }
+    console.log(`\nproof (chain-verified):\n${finalized.value.yaml}`);
+    if (finalized.value.written) console.log(`wrote proof to ${file}`);
+    return 0;
+  }
+
+  const file = argv[1];
+  if (!file) {
+    console.error(`usage: corridor ${cmd} <file.corridor.yaml>`);
+    return 2;
   }
 
   const loaded = loadCorridor(file);
@@ -87,6 +165,46 @@ async function main(argv: string[]): Promise<number> {
   return 0;
 }
 
+async function openStore(): Promise<
+  { store: PostgresIdempotencyStore; close: () => Promise<void> } | undefined
+> {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    console.error("✗ DATABASE_URL is required for corridor run operations");
+    return undefined;
+  }
+  const { Pool } = await import("pg");
+  const pool = new Pool({ connectionString });
+  await migrate(pool);
+  return { store: new PostgresIdempotencyStore(pool), close: () => pool.end() };
+}
+
+async function resolveCommand(args: string[]): Promise<number> {
+  const parsed = parseResolveArgs(args);
+  if (!parsed) {
+    console.error(RESOLVE_USAGE);
+    return 2;
+  }
+  const resolvedBy = process.env.CORRIDOR_OPERATOR_ID?.trim();
+  if (!resolvedBy) {
+    console.error("✗ CORRIDOR_OPERATOR_ID is required to record who resolved the run");
+    return 1;
+  }
+  return withStore((store) => resolveHeldRun(store, parsed, resolvedBy));
+}
+
+async function withStore(
+  fn: (store: PostgresIdempotencyStore) => Promise<number>,
+): Promise<number> {
+  const opened = await openStore();
+  if (!opened) return 1;
+  try {
+    return await fn(opened.store);
+  } finally {
+    await opened.close();
+  }
+}
+
 function printPlan(c: Corridor): void {
   const line = (s = "") => console.log(s);
   line(`corridor: ${c.id}`);
@@ -99,6 +217,12 @@ function printPlan(c: Corridor): void {
   );
   line(`dest:     ${c.dest.name}  [${c.dest.asset}]  ${c.dest.endpoints.home_domain}`);
   line(`bridge:   ${c.settlement.bridge_asset} on ${c.settlement.network}`);
+  if (c.limits && (c.limits.min_amount !== undefined || c.limits.max_amount !== undefined)) {
+    const parts: string[] = [];
+    if (c.limits.min_amount !== undefined) parts.push(`min=${c.limits.min_amount}`);
+    if (c.limits.max_amount !== undefined) parts.push(`max=${c.limits.max_amount}`);
+    line(`limits:   ${parts.join(" ")}`);
+  }
   line(
     `recovery: retries=${c.recovery.max_retries}, timeout=${c.recovery.timeout_seconds}s, rollback=${c.recovery.rollback}`,
   );
@@ -112,8 +236,7 @@ function printPlan(c: Corridor): void {
   line();
 
   // Liveness comes from @corridor/manifest so this command and the web dashboard
-  // can never describe the same corridor differently. A proven lane has a fresh
-  // chain-verified canary; a merely verified lane has only endpoint evidence.
+  // can never describe the same corridor differently.
   const live = liveness(c);
 
   if (live.state === "proven" && live.proof) {
@@ -155,9 +278,11 @@ function printPlan(c: Corridor): void {
   }
 }
 
-main(process.argv.slice(2))
+void main(process.argv.slice(2))
   .then((code) => process.exit(code))
   .catch((error: unknown) => {
-    console.error(error);
+    console.error(
+      `✗ corridor command failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
     process.exit(1);
   });

@@ -2,14 +2,14 @@ import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Scalar, YAMLMap, parseDocument, stringify } from "yaml";
 import type { Corridor, Proof } from "@corridor/manifest";
 import type { RunResult, SettlementRequest } from "@corridor/engine";
-import type { PaymentExpectation, TransactionFacts } from "@corridor/stellar";
+import { verifySettlementFacts, type SettlementFacts } from "@corridor/stellar";
 import { compareAmounts, fail, isSettleableAmount, ok, type Outcome } from "@corridor/types";
 
-/** A first canary is deliberately small until an operator records a lane-specific cap. */
-export const DEFAULT_CANARY_MAX_AMOUNT = "1.00";
+import { DEFAULT_CANARY_MAX_AMOUNT } from "./wire.js";
 
+/** Reads a settlement transaction back from Horizon (`AccountInspector` satisfies this). */
 export interface PaymentVerifier {
-  verifyPayment(expectation: PaymentExpectation): Promise<Outcome<TransactionFacts>>;
+  settlementFacts(hash: string): Promise<Outcome<SettlementFacts>>;
 }
 
 export interface CanarySettlement {
@@ -31,7 +31,7 @@ export interface FinalizeCanaryOptions extends BuildProofOptions {
 
 export interface CanaryProofResult {
   readonly proof: Proof;
-  readonly transaction: TransactionFacts;
+  readonly transaction: SettlementFacts;
   readonly yaml: string;
   readonly written: boolean;
 }
@@ -79,16 +79,10 @@ export async function buildCanaryProof(
     );
   }
 
-  const verified = await verifier.verifyPayment({
-    hash: result.stellarTxHash,
-    to: settlement.to,
-    amount: settlement.amount.amount,
-    memo: settlement.memo,
-    memoType: settlement.memoType,
-    assetCode: corridor.settlement.bridge_asset,
-    assetIssuer: corridor.settlement.asset_issuer,
-  });
-  if (!verified.ok) return verified;
+  const facts = await verifier.settlementFacts(result.stellarTxHash);
+  if (!facts.ok) return facts;
+  const matched = verifySettlementFacts(facts.value, settlement);
+  if (!matched.ok) return matched;
 
   const proof: Proof = {
     canary_completed_at: isoDate(opts.now ?? new Date()),
@@ -100,7 +94,7 @@ export async function buildCanaryProof(
   };
   const yaml = stringify({ proof }).trimEnd();
 
-  return ok({ proof, transaction: verified.value, yaml, written: false });
+  return ok({ proof, transaction: facts.value, yaml, written: false });
 }
 
 /** Update only the proof node, leaving every existing comment in place. */
